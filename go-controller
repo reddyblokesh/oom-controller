@@ -1,0 +1,106 @@
+import time
+from kubernetes import client, config, watch
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Configuration
+NAMESPACE = "ml-prod"
+LABEL_SELECTOR = "app=ml-controller"
+MAINTENANCE_FILE = "/app/dist/maintenance/in_maintenance_file"
+MAX_RESTART_PERCENT = 0.25 
+
+def get_k8s_client():
+    """Initialize Kubernetes API client."""
+    try:
+        config.load_incluster_config()  # Use in-cluster config
+        return client.CoreV1Api()
+    except Exception as e:
+        logging.error(f"Failed to initialize Kubernetes client: {e}")
+        raise
+
+def count_restarting_pods(v1, namespace, label_selector):
+    """Count pods with needs-restart=true or maintenance file."""
+    try:
+        pods = v1.list_namespaced_pod(namespace, label_selector=label_selector).items
+        restarting = 0
+        for pod in pods:
+            # Check for needs-restart annotation
+            annotations = pod.metadata.annotations or {}
+            if annotations.get("needs-restart") == "true":
+                restarting += 1
+                continue
+            # Check for maintenance file (optional, requires exec)
+            try:
+                exec_command = ["test", "-f", MAINTENANCE_FILE]
+                resp = v1.connect_get_namespaced_pod_exec(
+                    pod.metadata.name, namespace, command=exec_command,
+                    stderr=False, stdin=False, stdout=False, tty=False
+                )
+                if resp == 0:
+                    restarting += 1
+            except client.exceptions.ApiException:
+                pass  # Ignore if exec fails (pod may be unhealthy)
+        return restarting, len(pods)
+    except client.exceptions.ApiException as e:
+        logging.error(f"Failed to list pods: {e}")
+        return 0, 0
+
+def create_maintenance_file(v1, namespace, pod_name):
+    """Create maintenance file in the specified pod."""
+    try:
+        exec_command = ["touch", MAINTENANCE_FILE]
+        v1.connect_get_namespaced_pod_exec(
+            pod_name, namespace, command=exec_command,
+            stderr=True, stdin=False, stdout=True, tty=False
+        )
+        logging.info(f"Created maintenance file in pod {pod_name}")
+    except client.exceptions.ApiException as e:
+        logging.error(f"Failed to create maintenance file in pod {pod_name}: {e}")
+
+def remove_needs_restart_annotation(v1, namespace, pod_name):
+    """Remove needs-restart annotation from the pod."""
+    try:
+        body = {"metadata": {"annotations": {"needs-restart": None}}}
+        v1.patch_namespaced_pod(pod_name, namespace, body)
+        logging.info(f"Removed needs-restart annotation from pod {pod_name}")
+    except client.exceptions.ApiException as e:
+        logging.error(f"Failed to remove annotation from pod {pod_name}: {e}")
+
+def main():
+    v1 = get_k8s_client()
+    w = watch.Watch()
+    while True:
+        try:
+            # Watch for pod changes
+            for event in w.stream(v1.list_namespaced_pod, namespace=NAMESPACE, label_selector=LABEL_SELECTOR, timeout_seconds=60):
+                pod = event['object']
+                pod_name = pod.metadata.name
+                annotations = pod.metadata.annotations or {}
+
+                # Skip pods not needing restart
+                if annotations.get("needs-restart") != "true":
+                    continue
+
+                # Check restart limit
+                restarting, total_pods = count_restarting_pods(v1, NAMESPACE, LABEL_SELECTOR)
+                if total_pods == 0:
+                    logging.warning("No pods found with label selector.")
+                    continue
+
+                max_restarting = max(1, (total_pods + 3) // 4)  
+                if restarting >= max_restarting:
+                    logging.info(f"Restart limit reached: {restarting}/{total_pods} pods restarting, max {max_restarting}")
+                    continue
+
+                # Create maintenance file to trigger restart
+                logging.info(f"Allowing restart for pod {pod_name}")
+                create_maintenance_file(v1, NAMESPACE, pod_name)
+                remove_needs_restart_annotation(v1, NAMESPACE, pod_name)
+        except Exception as e:
+            logging.error(f"Error in watch loop: {e}")
+            time.sleep(10)  # Retry after delay
+
+if __name__ == "__main__":
+    main()
